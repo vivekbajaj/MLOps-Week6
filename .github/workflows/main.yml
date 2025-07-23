@@ -4,6 +4,16 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  repository-projects: write
+
+env:
+  IMAGE: us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.GCP_ARTIFACT_REPO }}/iris-api:latest
+
 jobs:
   build-push-deploy:
     runs-on: ubuntu-latest
@@ -16,3 +26,143 @@ jobs:
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+      
+      - name: Install GKE auth plugin
+        run: |
+          gcloud components install gke-gcloud-auth-plugin --quiet
+          echo "GKE auth plugin installed successfully"
+
+      - name: Configure docker for Artifact Registry
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: Build and Push Docker image
+        run: |
+          docker build -t $IMAGE .
+          docker push $IMAGE
+
+      - name: Get GKE credentials
+        run: |
+          gcloud container clusters get-credentials ${{ secrets.GKE_CLUSTER_NAME }} --zone ${{ secrets.GKE_ZONE }} --project ${{ secrets.GCP_PROJECT_ID }}
+     
+      - name: Verify kubectl connection
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+          
+      - name: Deploy to GKE
+        run: |
+          kubectl apply -f deployment.yaml
+          kubectl apply -f service.yaml
+
+      - name: Wait for rollout to finish
+        run: |
+          kubectl rollout status deployment/demo-iris-workload --timeout=300s
+
+      - name: Get service external IP
+        id: get-ip
+        run: |
+          echo "Waiting for external IP..."
+          for i in {1..30}; do
+            EXTERNAL_IP=$(kubectl get svc demo-iris-workload-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            if [[ ! -z "$EXTERNAL_IP" ]]; then
+              echo "External IP found: $EXTERNAL_IP"
+              echo "EXTERNAL_IP=$EXTERNAL_IP" >> $GITHUB_OUTPUT
+              break
+            fi
+            echo "Attempt $i: Waiting for external IP..."
+            sleep 20
+          done
+          if [[ -z "$EXTERNAL_IP" ]]; then
+            echo "Failed to get external IP after 10 minutes"
+            exit 1
+          fi
+
+    outputs:
+      external_ip: ${{ steps.get-ip.outputs.EXTERNAL_IP }}
+
+  cml-report:
+    needs: build-push-deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Setup CML
+        uses: iterative/setup-cml@v2
+
+      - name: Wait for service and test model endpoint
+        run: |
+          EXTERNAL_IP="${{ needs.build-push-deploy.outputs.external_ip }}"
+          echo "Testing API at: http://$EXTERNAL_IP"
+          
+          # Wait for service to be ready
+          echo "Waiting for service to be ready..."
+          for i in {1..10}; do
+            if curl -s --max-time 10 "http://$EXTERNAL_IP/health" > /dev/null; then
+              echo "Service is ready!"
+              break
+            fi
+            echo "Attempt $i: Service not ready, waiting..."
+            sleep 30
+          done
+
+          # Generate CML report
+          echo "## 🌸 Iris Model Live Prediction Test" > report.md
+          echo "" >> report.md
+          echo "**Deployment Status:** ✅ Successfully deployed to GKE" >> report.md
+          echo "**External IP:** \`$EXTERNAL_IP\`" >> report.md
+          echo "" >> report.md
+          
+          echo "### Test Input" >> report.md
+          echo "\`\`\`json" >> report.md
+          echo '{"sepal_length":5.1,"sepal_width":3.5,"petal_length":1.4,"petal_width":0.2}' >> report.md
+          echo "\`\`\`" >> report.md
+          echo "" >> report.md
+          
+          echo "### API Response" >> report.md
+          echo "\`\`\`json" >> report.md
+          curl -s -X POST "http://$EXTERNAL_IP/predict/" \
+            -H "Content-Type: application/json" \
+            -d '{"sepal_length":5.1,"sepal_width":3.5,"petal_length":1.4,"petal_width":0.2}' >> report.md || echo "API call failed" >> report.md
+          echo "" >> report.md
+          echo "\`\`\`" >> report.md
+          echo "" >> report.md
+          
+          echo "### Additional Test Cases" >> report.md
+          echo "\`\`\`json" >> report.md
+          echo "Test 2 (Versicolor):"
+          curl -s -X POST "http://$EXTERNAL_IP/predict/" \
+            -H "Content-Type: application/json" \
+            -d '{"sepal_length":7.0,"sepal_width":3.2,"petal_length":4.7,"petal_width":1.4}' >> report.md || echo "API call failed" >> report.md
+          echo "" >> report.md
+          echo "Test 3 (Virginica):"
+          curl -s -X POST "http://$EXTERNAL_IP/predict/" \
+            -H "Content-Type: application/json" \
+            -d '{"sepal_length":6.3,"sepal_width":3.3,"petal_length":6.0,"petal_width":2.5}' >> report.md || echo "API call failed" >> report.md
+          echo "\`\`\`" >> report.md
+          echo "" >> report.md
+          echo "---" >> report.md
+          echo "*Generated by GitHub Actions CI/CD Pipeline*" >> report.md
+
+      - name: Create CML report
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Try to create comment first
+          if ! cml comment create report.md; then
+            echo "Failed to create comment, trying pull request comment..."
+            # Alternative: try to create as PR comment if this is a PR
+            if [ "${{ github.event_name }}" == "pull_request" ]; then
+              cml comment create report.md --pr
+            else
+              echo "Creating report as job summary instead..."
+              cat report.md >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
