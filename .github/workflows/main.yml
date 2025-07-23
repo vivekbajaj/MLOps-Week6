@@ -1,0 +1,18 @@
+name: Build, Push, Deploy & CML Report
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+jobs:
+  build-push-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
